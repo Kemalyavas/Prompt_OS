@@ -1,76 +1,79 @@
 import os
-from typing import Optional, Any, Dict
+from typing import Any, Dict
 
-try:
-    from clerk import Client
-except Exception:
-    Client = None
-
+# Gerekli kütüphaneleri import ediyoruz. Bunların yüklü olduğundan emin ol:
+# pip install httpx "PyJWT[crypto]"
+import httpx
+import jwt
+from jwt import algorithms
 
 class ClerkClient:
-    """Small wrapper around the async `clerk.Client` to provide a simple
-    `verify_token` async method that returns a dict with a 'sub' key (user id).
+    """Clerk'ten gelen JWT token'larını JWKS kullanarak doğrulamak için bir istemci."""
 
-    This lets existing code call `await clerk_client.verify_token(token)` and get
-    a consistent payload.
-    """
+    def __init__(self):
+        # Bu istemcinin artık API anahtarına ihtiyacı yok, çünkü doğrulama yerel olarak yapılıyor.
+        self.issuer = os.getenv("CLERK_ISSUER_URL")
+        if not self.issuer:
+            raise RuntimeError("CLERK_ISSUER_URL ortam değişkeni .env dosyasında ayarlanmamış.")
+        self.jwks_url = self.issuer.rstrip("/") + "/.well-known/jwks.json"
+        self._jwks_cache = None
 
-    def __init__(self, base_url: Optional[str] = None, api_key: Optional[str] = None):
-        if Client is None:
-            raise RuntimeError("clerk package not installed in the environment")
-
-        # Prefer explicit api_key, then CLERK_SECRET_KEY (server-side), then CLERK_API_KEY
-        token = api_key or os.getenv("CLERK_SECRET_KEY") or os.getenv("CLERK_API_KEY")
-        # Use Clerk REST API base. Do NOT use issuer URL here.
-        base = base_url or "https://api.clerk.dev/v1/"
-
-        # Client expects (token, base_url=...)
-        self._client = Client(token, base_url=base)
+    async def _get_jwks(self) -> Dict[str, Any]:
+        """Clerk'in JWKS (JSON Web Key Set) verisini getirir ve cache'ler."""
+        if self._jwks_cache:
+            return self._jwks_cache
+        
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(self.jwks_url)
+            response.raise_for_status() # Hata varsa exception fırlat
+            self._jwks_cache = response.json()
+            return self._jwks_cache
 
     async def verify_token(self, token: str) -> Dict[str, Any]:
-        """Verify a Clerk frontend token and return a dict with 'sub' (user id).
-
-        Strategy:
-        1) Try JWT verification against Clerk JWKS (works with useAuth().getToken()).
-        2) Fallback to Clerk REST verification API (works with session token).
-        """
-        # 1) Try JWT verification via JWKS
+        """Verilen JWT'yi Clerk'in public key'lerini kullanarak doğrular."""
         try:
-            import httpx  # type: ignore
-            import jwt  # type: ignore
-            from jwt import algorithms  # type: ignore
-
-            issuer = os.getenv("CLERK_ISSUER_URL")
-            if not issuer:
-                raise RuntimeError("CLERK_ISSUER_URL not set")
-
-            jwks_url = issuer.rstrip("/") + "/.well-known/jwks.json"
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                jwks = (await client.get(jwks_url)).json()
-
-            # Build key set
-            key = algorithms.RSAAlgorithm.from_jwk
+            jwks = await self._get_jwks()
             unverified_header = jwt.get_unverified_header(token)
             kid = unverified_header.get("kid")
+            if not kid:
+                raise ValueError("Token header'ında 'kid' (Key ID) bulunamadı.")
+
             public_key = None
-            for k in jwks.get("keys", []):
-                if k.get("kid") == kid:
-                    public_key = key(k)
+            for key_data in jwks.get("keys", []):
+                if key_data.get("kid") == kid:
+                    public_key = algorithms.RSAAlgorithm.from_jwk(key_data)
                     break
+            
             if public_key is None:
-                raise RuntimeError("Matching JWKS key not found")
+                # Cache'i temizleyip tekrar deneyelim, belki key'ler güncellenmiştir.
+                self._jwks_cache = None 
+                jwks = await self._get_jwks()
+                for key_data in jwks.get("keys", []):
+                    if key_data.get("kid") == kid:
+                        public_key = algorithms.RSAAlgorithm.from_jwk(key_data)
+                        break
+                if public_key is None:
+                    raise RuntimeError(f"Token'ı doğrulayacak uygun bir public key bulunamadı (kid: {kid}).")
 
             payload = jwt.decode(
                 token,
                 public_key,
                 algorithms=["RS256"],
-                audience=None,  # adjust if you enforce aud
-                options={"verify_aud": False},
-                issuer=issuer.rstrip("/")
+                issuer=self.issuer.rstrip("/")
             )
+            
+            # 'sub' alanı kullanıcının ID'sini içerir.
             sub = payload.get("sub")
+            if not sub:
+                raise ValueError("Token payload'ında 'sub' (subject/user ID) alanı bulunamadı.")
+            
             return {"sub": sub}
-        except Exception:
-            # 2) Fallback to Clerk REST verification (expects a session token)
-            session = await self._client.verification.verify(token)
-            return {"sub": getattr(session, "user_id", None)}
+
+        except jwt.ExpiredSignatureError:
+            raise Exception("Token'ın süresi dolmuş.")
+        except jwt.InvalidIssuerError:
+            raise Exception("Token'ın 'issuer' bilgisi geçersiz.")
+        except Exception as e:
+            # Diğer tüm JWT hatalarını veya genel hataları yakala
+            raise Exception(f"Token doğrulama hatası: {e}")
+

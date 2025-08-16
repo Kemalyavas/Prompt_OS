@@ -16,7 +16,8 @@ models.Base.metadata.create_all(bind=engine)
 load_dotenv()
 
 # Clerk istemcisini başlat (server-side secret key kullan)
-clerk_client = ClerkClient(api_key=os.getenv("CLERK_SECRET_KEY"))
+clerk_client = ClerkClient()
+
 
 app = FastAPI()
 
@@ -44,24 +45,28 @@ def get_db():
 # Dependency: Kullanıcı kimliğini doğrulamak ve kullanıcıyı getirmek için
 async def get_current_user(req: Request, db: Session = Depends(get_db)) -> models.User:
     try:
-        # Frontend'den gelen 'Authorization' header'ını al
         auth_header = req.headers.get('Authorization')
-        token = auth_header.split(' ')[1]
+        if not auth_header:
+            raise HTTPException(status_code=401, detail="Authorization header missing")
 
-        # Token'ı doğrula (async)
+        parts = auth_header.split(' ')
+        if len(parts) != 2 or parts[0] != 'Bearer':
+            raise HTTPException(status_code=401, detail="Invalid authorization header format")
+        
+        token = parts[1]
         decoded_token = await clerk_client.verify_token(token)
-        user_id = decoded_token['sub'] or None
-
+        user_id = decoded_token.get('sub')
+        
         if not user_id:
-            raise ValueError("Invalid token: no user id returned")
+            raise HTTPException(status_code=401, detail="Invalid token: user ID not found")
 
     except Exception as e:
-        raise HTTPException(status_code=401, detail=f"Invalid authentication credentials: {e}")
+        # HATA AYIKLAMA: Orijinal hatayı terminale yazdır
+        print(f"!!! CLERK AUTHENTICATION ERROR: {e}") 
+        raise HTTPException(status_code=401, detail=f"Invalid authentication credentials")
 
-    # Kullanıcı veritabanında var mı diye kontrol et
     user = db.query(models.User).filter(models.User.id == user_id).first()
 
-    # Eğer yoksa, yeni bir kullanıcı oluştur (ilk girişi olabilir)
     if not user:
         new_user = models.User(id=user_id)
         db.add(new_user)
@@ -78,23 +83,23 @@ def read_root():
     return {"message": "Backend çalışıyor!"}
 
 @app.post("/api/projects", response_model=schemas.Project)
-def create_project(
+async def create_project(
     project: schemas.ProjectCreate, 
     db: Session = Depends(get_db), 
-    current_user: models.User = Depends(get_current_user) # Bu endpoint'i koru
+    current_user: models.User = Depends(get_current_user)
 ):
-    # Yeni bir proje nesnesi oluştur ve sahibini o anki kullanıcı olarak ata
     db_project = models.Project(**project.dict(), owner_id=current_user.id)
     db.add(db_project)
     db.commit()
     db.refresh(db_project)
     return db_project
 
+# BU FONKSİYONU ASYNC OLARAK GÜNCELLE
 @app.get("/api/projects", response_model=list[schemas.Project])
-def read_projects(
+async def read_projects(
     db: Session = Depends(get_db), 
-    current_user: models.User = Depends(get_current_user) # Bu endpoint'i koru
+    current_user: models.User = Depends(get_current_user)
 ):
-    # Sadece o anki kullanıcıya ait projeleri getir
     projects = db.query(models.Project).filter(models.Project.owner_id == current_user.id).all()
     return projects
+
